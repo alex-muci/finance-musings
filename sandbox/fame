@@ -1,0 +1,209 @@
+import numpy as np
+import pandas as pd
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+from typing import Tuple, Dict
+
+class FAMESpreadHedge:
+    def __init__(self, 
+                 vol_window: int = 21,
+                 regime_window: int = 63,
+                 rebalance_threshold: float = 0.15):  # 15% change in ratios triggers rebalance
+        """
+        Initialize the FAME-Gasoil spread hedging system
+        
+        Parameters:
+        vol_window: window for volatility calculation
+        regime_window: window for regime detection
+        rebalance_threshold: minimum change in hedge ratios to trigger rebalance
+        """
+        self.vol_window = vol_window
+        self.regime_window = regime_window
+        self.rebalance_threshold = rebalance_threshold
+        
+    def calculate_spread_metrics(self, 
+                               fame_prices: pd.Series,
+                               gasoil_prices: pd.Series,
+                               rapeseed_prices: pd.Series) -> pd.DataFrame:
+        """
+        Calculate core spread metrics including theoretical and actual volatilities
+        """
+        # Calculate returns
+        fame_rets = fame_prices.pct_change()
+        gasoil_rets = gasoil_prices.pct_change()
+        rapeseed_rets = rapeseed_prices.pct_change()
+        spread_rets = fame_rets - gasoil_rets
+        
+        # Rolling volatilities
+        fame_vol = fame_rets.rolling(self.vol_window).std() * np.sqrt(252)
+        gasoil_vol = gasoil_rets.rolling(self.vol_window).std() * np.sqrt(252)
+        rapeseed_vol = rapeseed_rets.rolling(self.vol_window).std() * np.sqrt(252)
+        spread_vol = spread_rets.rolling(self.vol_window).std() * np.sqrt(252)
+        
+        # Rolling correlations
+        fame_gasoil_corr = fame_rets.rolling(self.vol_window).corr(gasoil_rets)
+        fame_rapeseed_corr = fame_rets.rolling(self.vol_window).corr(rapeseed_rets)
+        
+        # Theoretical spread volatility
+        theoretical_spread_vol = np.sqrt(
+            fame_vol**2 + gasoil_vol**2 - 
+            2 * fame_vol * gasoil_vol * fame_gasoil_corr
+        )
+        
+        # Volatility ratio (actual/theoretical)
+        vol_ratio = spread_vol / theoretical_spread_vol
+        
+        return pd.DataFrame({
+            'fame_vol': fame_vol,
+            'gasoil_vol': gasoil_vol,
+            'rapeseed_vol': rapeseed_vol,
+            'spread_vol': spread_vol,
+            'theoretical_spread_vol': theoretical_spread_vol,
+            'vol_ratio': vol_ratio,
+            'fame_gasoil_corr': fame_gasoil_corr,
+            'fame_rapeseed_corr': fame_rapeseed_corr
+        })
+    
+    def detect_regime(self, metrics: pd.DataFrame) -> pd.Series:
+        """
+        Detect volatility regime based on rolling metrics
+        """
+        # Calculate regime based on vol ratio relative to its moving average
+        vol_ratio_ma = metrics['vol_ratio'].rolling(self.regime_window).mean()
+        
+        # Define regimes:
+        # 1: Low vol ratio (< 0.8 * MA)
+        # 2: Normal vol ratio (0.8-1.2 * MA)
+        # 3: High vol ratio (> 1.2 * MA)
+        regime = pd.Series(2, index=metrics.index)  # Default to normal regime
+        regime[metrics['vol_ratio'] < 0.8 * vol_ratio_ma] = 1
+        regime[metrics['vol_ratio'] > 1.2 * vol_ratio_ma] = 3
+        
+        return regime
+    
+    def calculate_hedge_ratios(self, 
+                             metrics: pd.DataFrame, 
+                             regime: pd.Series) -> Tuple[pd.Series, pd.Series]:
+        """
+        Calculate dynamic hedge ratios for Gasoil and Rapeseed
+        """
+        # Base hedge ratios
+        gasoil_base = 1.0  # Direct differential hedge
+        
+        # Adjust based on regime
+        gasoil_ratio = pd.Series(gasoil_base, index=metrics.index)
+        rapeseed_ratio = pd.Series(0.0, index=metrics.index)
+        
+        # Regime adjustments
+        for date in metrics.index:
+            curr_regime = regime[date]
+            
+            if curr_regime == 1:  # Low vol ratio
+                gasoil_ratio[date] = gasoil_base
+                rapeseed_ratio[date] = 0.3  # Add some rapeseed exposure
+                
+            elif curr_regime == 2:  # Normal
+                gasoil_ratio[date] = gasoil_base * metrics['vol_ratio'][date]
+                rapeseed_ratio[date] = 0.2
+                
+            else:  # High vol ratio
+                gasoil_ratio[date] = gasoil_base * metrics['vol_ratio'][date] * 1.2
+                rapeseed_ratio[date] = 0.1  # Reduce rapeseed exposure
+        
+        return gasoil_ratio, rapeseed_ratio
+    
+    def backtest_hedge(self,
+                      fame_prices: pd.Series,
+                      gasoil_prices: pd.Series,
+                      rapeseed_prices: pd.Series) -> Dict:
+        """
+        Backtest the hedging strategy
+        """
+        # Calculate returns
+        fame_rets = fame_prices.pct_change()
+        gasoil_rets = gasoil_prices.pct_change()
+        rapeseed_rets = rapeseed_prices.pct_change()
+        
+        # Calculate metrics and regimes
+        metrics = self.calculate_spread_metrics(fame_prices, gasoil_prices, rapeseed_prices)
+        regime = self.detect_regime(metrics)
+        gasoil_ratio, rapeseed_ratio = self.calculate_hedge_ratios(metrics, regime)
+        
+        # Calculate hedged returns
+        hedged_rets = fame_rets - gasoil_rets  # Spread return
+        hedged_rets = hedged_rets - (gasoil_ratio * gasoil_rets + rapeseed_ratio * rapeseed_rets)
+        
+        # Calculate performance metrics
+        perf_metrics = {
+            'Annualized Return': hedged_rets.mean() * 252,
+            'Annualized Vol': hedged_rets.std() * np.sqrt(252),
+            'Sharpe Ratio': (hedged_rets.mean() * 252) / (hedged_rets.std() * np.sqrt(252)),
+            'Max Drawdown': (1 + hedged_rets).cumprod().div((1 + hedged_rets).cumprod().cummax()) - 1,
+            'Hedge Ratios': {
+                'Gasoil': gasoil_ratio.describe(),
+                'Rapeseed': rapeseed_ratio.describe()
+            }
+        }
+        
+        return {
+            'returns': hedged_rets,
+            'metrics': perf_metrics,
+            'hedge_ratios': pd.DataFrame({
+                'gasoil_ratio': gasoil_ratio,
+                'rapeseed_ratio': rapeseed_ratio
+            })
+        }
+    
+    def plot_results(self, backtest_results: Dict):
+        """
+        Plot backtest results
+        """
+        fig, axs = plt.subplots(3, 1, figsize=(12, 15))
+        
+        # Plot cumulative returns
+        cum_rets = (1 + backtest_results['returns']).cumprod()
+        axs[0].plot(cum_rets.index, cum_rets.values)
+        axs[0].set_title('Cumulative Returns of Hedged Position')
+        axs[0].set_xlabel('Date')
+        axs[0].set_ylabel('Cumulative Return')
+        
+        # Plot hedge ratios
+        ratios = backtest_results['hedge_ratios']
+        axs[1].plot(ratios.index, ratios['gasoil_ratio'], label='Gasoil')
+        axs[1].plot(ratios.index, ratios['rapeseed_ratio'], label='Rapeseed')
+        axs[1].set_title('Dynamic Hedge Ratios')
+        axs[1].set_xlabel('Date')
+        axs[1].set_ylabel('Hedge Ratio')
+        axs[1].legend()
+        
+        # Plot rolling volatility of hedged returns
+        rolling_vol = backtest_results['returns'].rolling(21).std() * np.sqrt(252)
+        axs[2].plot(rolling_vol.index, rolling_vol.values)
+        axs[2].set_title('Rolling Volatility of Hedged Position')
+        axs[2].set_xlabel('Date')
+        axs[2].set_ylabel('Annualized Volatility')
+        
+        plt.tight_layout()
+        return fig
+
+# Usage example:
+"""
+# Initialize the hedging system
+hedge_system = FAMESpreadHedge(vol_window=21, regime_window=63)
+
+# Run backtest
+results = hedge_system.backtest_hedge(fame_prices, gasoil_prices, rapeseed_prices)
+
+# Plot results
+hedge_system.plot_results(results)
+
+# Access performance metrics
+print("Performance Metrics:")
+for key, value in results['metrics'].items():
+    if key != 'Hedge Ratios':
+        print(f"{key}: {value:.4f}")
+
+print("\nHedge Ratio Statistics:")
+print(results['metrics']['Hedge Ratios'])
+"""
